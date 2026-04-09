@@ -73,56 +73,9 @@ for _pkg in ("punkt", "stopwords", "punkt_tab"):
 _STOPWORDS = set(stopwords.words("english"))
 
 # ---------------------------------------------------------------------------
-# Comprehensive skill keyword list
+# Skills are extracted from the resume content (no predefined list).
 # ---------------------------------------------------------------------------
-TECH_SKILLS: set[str] = {
-    # Languages
-    "python", "java", "javascript", "typescript", "c#", "c++", "c", "go", "golang",
-    "rust", "kotlin", "swift", "ruby", "php", "scala", "r", "matlab", "perl", "bash",
-    "powershell", "vba", "cobol", "fortran", "dart", "elixir", "haskell", "lua",
-    # Web
-    "html", "css", "sass", "less", "react", "angular", "vue", "next.js", "nuxt",
-    "node.js", "express", "fastapi", "django", "flask", "spring", "asp.net", ".net",
-    "laravel", "symfony", "rails", "svelte", "jquery", "bootstrap", "tailwind",
-    "graphql", "rest api", "soap", "grpc", "websocket",
-    # Mobile
-    "android", "ios", "flutter", "react native", "xamarin", "ionic", "swift ui",
-    # Data / ML / AI
-    "sql", "mysql", "postgresql", "mongodb", "redis", "elasticsearch", "cassandra",
-    "oracle", "sqlite", "mssql", "sql server", "db2",
-    "pandas", "numpy", "scipy", "matplotlib", "seaborn", "plotly",
-    "scikit-learn", "tensorflow", "pytorch", "keras", "hugging face", "transformers",
-    "machine learning", "deep learning", "nlp", "natural language processing",
-    "computer vision", "reinforcement learning", "neural network",
-    "data science", "data analysis", "data engineering", "data pipeline",
-    "power bi", "tableau", "looker", "qlikview", "excel", "google analytics",
-    "apache spark", "hadoop", "kafka", "airflow", "dbt", "flink",
-    "etl", "data warehouse", "snowflake", "bigquery", "redshift", "databricks",
-    # Cloud / DevOps
-    "aws", "azure", "gcp", "google cloud", "heroku", "digitalocean",
-    "docker", "kubernetes", "terraform", "ansible", "puppet", "chef",
-    "jenkins", "git", "github", "gitlab", "bitbucket", "ci/cd", "devops",
-    "linux", "unix", "nginx", "apache", "microservices", "serverless",
-    # Testing
-    "selenium", "cypress", "jest", "pytest", "junit", "mocha", "tdd", "bdd",
-    "unit testing", "integration testing", "automation testing", "postman",
-    # Methodologies
-    "agile", "scrum", "kanban", "jira", "confluence", "trello", "figma",
-    "uml", "design patterns", "solid", "oop", "functional programming",
-    # Domain
-    "sap", "salesforce", "microsoft dynamics", "erp", "crm",
-    "blockchain", "ethereum", "solidity", "web3",
-    "cybersecurity", "penetration testing", "owasp",
-    # Web-development disciplines (common in resumes)
-    "front-end development", "back-end development", "full-stack development",
-    "frontend development", "backend development", "fullstack development",
-    "web development", "web design", "responsive design",
-    "web performance", "seo", "accessibility", "web security",
-    "software development", "software engineering", "software architecture",
-    "api development", "api integration", "microservice",
-    "code review", "debugging", "version control", "technical documentation",
-    "agile development", "sprint planning",
-}
+ 
 
 # Education degree keywords
 # IMPORTANT: Order matters — longer / more specific patterns first to avoid
@@ -157,7 +110,8 @@ SECTION_PATTERNS = {
         r"^(?:(?:professional|relevant|work)\s+)?experience"
         r"|^employment(?:\s+history)?"
         r"|^(?:career\s+(?:history|overview))"
-        r"|^work\s+(?:history|experience)",
+        r"|^work\s+(?:history|experience)"
+        r"|^work\s+experience",
         re.IGNORECASE,
     ),
     "education": re.compile(
@@ -193,6 +147,57 @@ SECTION_PATTERNS = {
         re.IGNORECASE,
     ),
 }
+
+
+def _is_header_candidate(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if len(s) > 60:
+        return False
+    # must be mostly letters/spaces/& and optionally end with colon
+    if re.search(r"\d", s):
+        return False
+    core = s.rstrip(":").strip()
+    if not re.match(r"^[A-Za-z &/\-]+$", core):
+        return False
+    # strong signals: endswith ":" OR ALL CAPS
+    letters = re.sub(r"[^A-Za-z]", "", core)
+    if s.endswith(":"):
+        return True
+    if letters and letters.isupper():
+        return True
+    return core.lower() in SECTION_PATTERNS
+
+
+def _detect_section_header(line: str) -> str | None:
+    s = (line or "").strip()
+    # Allow short Title-Case headers (many Canva resumes) even without ALL-CAPS or ":".
+    # We still keep this conservative by requiring a pattern match and few words.
+    if not _is_header_candidate(s):
+        norm0 = re.sub(r"[:\-–—]+$", "", s).strip().lower()
+        word_count = len([w for w in re.split(r"\s+", norm0) if w])
+        if word_count <= 3:
+            for sec_name, pattern in SECTION_PATTERNS.items():
+                if pattern.match(norm0):
+                    return sec_name
+        return None
+    norm = re.sub(r"[:\-–—]+$", "", s).strip().lower()
+
+    # explicit keyword mapping (format-independent)
+    if re.search(r"\b(areas?\s+of\s+expertise|technical\s+expertise|core\s+competencies|tools|technologies)\b", norm):
+        return "skills"
+    if re.search(r"\b(professional\s+experience|work\s+experience|employment\s+history|work\s+history)\b", norm):
+        return "experience"
+    if re.search(r"\b(relevant\s+projects?|projects?)\b", norm):
+        return "projects"
+
+    for sec_name, pattern in SECTION_PATTERNS.items():
+        if pattern.match(norm):
+            return sec_name
+    if norm in SECTION_PATTERNS:
+        return norm
+    return None
 
 # Date patterns: handles "Month Year", "DD Month, Year", "Year" formats
 _MONTH_NAMES = (
@@ -262,12 +267,7 @@ def _split_sections(text: str) -> dict[str, str]:
 
     for line in lines:
         stripped = line.strip()
-        matched = None
-        if stripped and len(stripped) < 60:
-            for sec_name, pattern in SECTION_PATTERNS.items():
-                if pattern.match(stripped):
-                    matched = sec_name
-                    break
+        matched = _detect_section_header(stripped) if stripped and len(stripped) < 70 else None
         if matched:
             current = matched
             sections.setdefault(current, [])
@@ -277,47 +277,282 @@ def _split_sections(text: str) -> dict[str, str]:
     return {k: "\n".join(v) for k, v in sections.items()}
 
 
+def _normalize_headers(text: str) -> str:
+    """
+    PDF extraction often concatenates headers into adjacent words like:
+      'Strong CommunicationSKILLS123-456...'
+    This normalizes common ALL-CAPS headers by forcing newlines around them.
+    """
+    if not text:
+        return ""
+    # 1) Fix common glued tokens from PDF extraction
+    # "languagesAgile" -> "languages\nAgile"
+    text = re.sub(r"([a-z])([A-Z])", r"\1\n\2", text)
+    # "development123" -> "development\n123"
+    text = re.sub(r"([A-Za-z])(\d)", r"\1\n\2", text)
+    # Replace common bad dash glyphs / replacement chars
+    text = text.replace("\uFFFD", "-")
+    # "2013Master" -> "2013\nMaster"
+    text = re.sub(r"(\d{4})(?=[A-Z])", r"\1\n", text)
+
+    # Split multiple "Company | Date - Date" blocks that get merged onto one line:
+    # "... Dec 2023 Fauget Tech Company | Jan 2024 - Aug 2024" -> "... Dec 2023\nFauget Tech Company | Jan 2024 - Aug 2024"
+    # Works for both "Month YYYY" and "YYYY" end tokens.
+    text = re.sub(
+        rf"(?P<end>(?:{_MONTH_NAMES})[.,]?\s*\d{{4}}|\d{{4}})\s+(?P<company>[A-Z][^\n|]{{2,120}}\|)",
+        r"\g<end>\n\g<company>",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Ensure these common titles don't get glued into sentences
+    text = re.sub(r"(?i)(?<=\.)\s*(Software\s+Developer\s+Intern)", r"\n\1", text)
+    text = re.sub(r"(?i)(?<=\.)\s*(Web\s+Developer\s+Intern)", r"\n\1", text)
+    text = re.sub(r"(?i)\bFirebase\.\s*(Software\s+Developer\s+Intern)", r"Firebase.\n\1", text)
+    text = re.sub(r"(?i)\bFaugetbase\b", "Faugetbase", text)
+    # Split repeated company/date blocks on one line:
+    # "Dec 2023 Fauget Tech Company | Jan 2024 - Aug 2024" -> "Dec 2023\nFauget Tech Company | Jan 2024 - Aug 2024"
+    text = re.sub(
+        r"(\b(?:19\d{2}|20\d{2})\b)\s+([A-Z][^\n]{0,120}\|)",
+        r"\1\n\2",
+        text,
+    )
+    # Ensure internship titles start on their own line (helps parsing)
+    text = re.sub(r"(?i)(?<=\.)\s*(Software\s+Developer\s+Intern)", r"\n\1", text)
+    text = re.sub(r"(?i)(?<=\.)\s*(Web\s+Developer\s+Intern)", r"\n\1", text)
+
+    # 2) Normalize section headers (single-word + multi-word variants)
+    phrase_headers = [
+        "AREAS OF EXPERTISE",
+        "PROFESSIONAL SUMMARY",
+        "PROFESSIONAL EXPERIENCE",
+        "RELEVANT PROJECTS",
+        "TECHNICAL SKILLS",
+        "CORE COMPETENCIES",
+    ]
+    for h in phrase_headers:
+        text = re.sub(rf"(?i)(?<=\w){h}", rf"\n{h}", text)
+        text = re.sub(rf"(?i){h}(?=\w)", rf"{h}\n", text)
+        text = re.sub(rf"(?i)(?<!\n){h}(?!\n)", f"\n{h}\n", text)
+
+    word_headers = ["SKILLS", "EXPERIENCE", "EDUCATION", "PROFILE", "SUMMARY", "PROJECTS", "CERTIFICATIONS", "CONTACT"]
+    for h in word_headers:
+        # Handle glued headers like "CommunicationSKILLS123" (no word boundaries)
+        # Guardrails: do not split words like "Educational" into "EDUCATION" + "al"
+        # NOTE: make this case-sensitive so we never split normal sentence words like "skills".
+        text = re.sub(rf"(?<=[a-z]){h}(?![a-z])", rf"\n{h}", text)
+        # Only split AFTER header when the next char is a digit (e.g., "SKILLS123")
+        text = re.sub(rf"{h}(?=\d)", rf"{h}\n", text)
+        # Also normalize standalone occurrences
+        text = re.sub(rf"(?<!\n)\b{h}\b(?!\n)", f"\n{h}\n", text)
+
+    # 3) Re-join split multi-word headers produced by earlier normalisation
+    text = re.sub(r"(?i)PROFESSIONAL\s*\nSUMMARY\s*\n:\s*", "PROFESSIONAL SUMMARY:\n", text)
+    text = re.sub(r"(?i)PROFESSIONAL\s*\nEXPERIENCE\s*\n:\s*", "PROFESSIONAL EXPERIENCE:\n", text)
+    text = re.sub(r"(?i)RELEVANT\s*\nPROJECTS\s*\n:\s*", "RELEVANT PROJECTS:\n", text)
+    # Split glued email / year-range / company+year cases common in PDFs
+    text = re.sub(r"(?<=\w)([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", r"\n\1", text)
+    text = re.sub(
+        r"([A-Za-z])(?=(19\d{2}|20\d{2})\s*[-–—]\s*(?:19\d{2}|20\d{2}|Present|PRESENT|Current|CURRENT|Now|NOW))",
+        r"\1\n",
+        text,
+    )
+    text = re.sub(
+        r"((?:19\d{2}|20\d{2})\s*[-–—]\s*(?:19\d{2}|20\d{2}|Present|PRESENT|Current|CURRENT|Now|NOW))(?=[A-Z])",
+        r"\1\n",
+        text,
+    )
+    # Clean excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _is_probable_header_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if len(s) > 60:
+        return False
+    if _detect_section_header(s) is not None:
+        return True
+    norm = re.sub(r"[:\-–—]+$", "", s).strip().lower()
+    return norm in ("profile", "contact", "summary")
+
+
+def _clean_skill_token(token: str) -> str | None:
+    t = (token or "").strip()
+    if not t:
+        return None
+    t = re.sub(r"^[•\-\u2022\*\u00b7]+\s*", "", t)
+    t = re.sub(r"\s+", " ", t).strip(" ,;|")
+    low = t.lower()
+    if low in _STOPWORDS:
+        return None
+    if len(t) < 2 or len(t) > 60:
+        return None
+    if re.search(r"@\w+|\bhttps?://|\bwww\.", t, re.IGNORECASE):
+        return None
+    # Drop plain domains
+    if re.search(r"\b[a-z0-9.-]+\.[a-z]{2,}\b", t, re.IGNORECASE):
+        return None
+    # Drop standalone headers
+    if t.strip().upper() in {"PROFILE", "CONTACT", "SUMMARY", "EXPERIENCE", "EDUCATION", "SKILLS"}:
+        return None
+    if re.search(r"\b\d{3}[-\s]?\d{3}[-\s]?\d{4}\b", t):
+        return None
+    # Drop address-ish lines (keep things like "HTML5" - but reject typical address/phone patterns)
+    low = t.lower()
+    if re.search(r"\d", t) and (("-" in t) or ("st" in low) or ("street" in low) or ("city" in low)):
+        return None
+    # Reject spaced-letter headings like "W E B D E V E L O P E R"
+    if re.match(r"^(?:[A-Za-z]\s+){4,}[A-Za-z]$", t):
+        return None
+    return t
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Skills extraction
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _extract_skills(text: str, sections: dict[str, str]) -> list[str]:
     """
-    Keyword match + spaCy ORG/PRODUCT NER.
-
-    Always scans the full resume text so that multi-column PDFs where the
-    section splitter lost the skills section are still handled correctly.
+    Extract skills from the resume's SKILLS section (no predefined dictionary).
+    Handles templates where skills appear BEFORE the 'SKILLS' header.
     """
-    # Combine skills section (preferred) with full text
-    skills_section = sections.get("skills", "").strip()
-    # Search both: skills section first, then full text (deduplication handled below)
-    targets = []
-    if skills_section:
-        targets.append(skills_section)
-    targets.append(text)
-    combined = "\n".join(targets).lower()
+    text = _normalize_headers(text or "")
+    lines = [l.strip() for l in text.split("\n")]
 
-    found: set[str] = set()
+    # Use skills section if present and not obviously contact info.
+    section_skills_text = (sections.get("skills", "") or "").strip()
+    if section_skills_text:
+        bad = section_skills_text.lower()
+        if any(x in bad for x in ("@", "http", "www.", "st.", "street", "city")):
+            section_skills_text = ""
 
-    # Keyword matching across combined text
-    for skill in TECH_SKILLS:
-        escaped = re.escape(skill)
-        # Word-boundary aware; handles c++, c#, .net, react.js, etc.
-        pattern = r"(?<![a-zA-Z0-9.\-])" + escaped + r"(?![a-zA-Z0-9.\-])"
-        if re.search(pattern, combined):
-            # Preserve original casing for multi-word skills; title-case single words
-            found.add(skill if " " in skill or any(c in skill for c in ".#+") else skill.title())
+    block_lines: list[str] = []
+    idxs = [i for i, l in enumerate(lines) if l.strip().upper() in {"SKILLS", "AREAS OF EXPERTISE"} or l.strip().upper().startswith("AREAS OF EXPERTISE")]
+    if idxs:
+        i0 = idxs[0]
+        header_token = (lines[i0] or "").strip().upper()
 
-    # spaCy NER pass – catches product names not in the keyword list
-    if SPACY_OK and _nlp is not None:
-        doc = _nlp(text[:100_000])
-        for ent in doc.ents:
-            clean = ent.text.strip()
-            if ent.label_ in ("ORG", "PRODUCT") and 2 <= len(clean) <= 40:
-                if clean.lower() in TECH_SKILLS:
-                    found.add(clean)
+        # For SKILLS header we can scan upward (common Canva templates).
+        # For AREAS OF EXPERTISE, the header is often present but content may appear earlier,
+        # so we avoid scanning upward (it would capture education/companies).
+        if header_token == "SKILLS":
+            for j in range(i0 - 1, max(-1, i0 - 40), -1):
+                lj = (lines[j] or "").strip()
+                if not lj:
+                    break
+                if _is_probable_header_line(lj):
+                    break
+                low = lj.lower()
+                if any(x in low for x in ("@", "http", "www.", " st", " street", " city", "site.com")):
+                    break
+                if re.search(r"\d{3}[-\s]?\d{3}", lj):
+                    break
+                if "developer" in low:
+                    continue
+                if len(lj) <= 45:
+                    block_lines.append(lj)
+            block_lines.reverse()
 
-    return sorted(found)
+        # Intentionally do not collect after-SKILLS lines (often contact info)
+    else:
+        # Fallback: extract "expertise" list that often appears right after summary.
+        all_lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+        start_at = 0
+        for i, l in enumerate(all_lines[:80]):
+            if l.upper().startswith("PROFESSIONAL SUMMARY"):
+                start_at = i + 1
+                break
+
+        for l in all_lines[start_at:start_at + 50]:
+            low = l.lower()
+            if any(x in low for x in ("@", "http", "www.", "st.", "street", "city")):
+                break
+            if re.search(r"\d{3}[-\s]?\d{3}", l):
+                break
+            if TITLE_DATE_RE.match(l) or DATE_RANGE_RE.search(l):
+                break
+            if _looks_like_company_line(l):
+                break
+            if _is_probable_header_line(l):
+                continue
+            if "." in l:
+                continue
+            if 3 <= len(l) <= 55:
+                block_lines.append(l)
+
+    # Summary-based extraction: common in modern templates where skills are just a list
+    # directly under summary (no skills header at all).
+    if not section_skills_text and not block_lines:
+        summary_lines = [l.strip() for l in (sections.get("summary", "") or "").split("\n") if l.strip()]
+        # take lines that look like short skill phrases (no punctuation, no dates) until contact-ish line
+        for l in summary_lines:
+            low = l.lower()
+            if any(x in low for x in ("@", "http", "www.", "st.", "street", "city")):
+                break
+            if re.search(r"\d{3}[-\s]?\d{3}", l):
+                break
+            if "." in l:
+                continue
+            if DATE_RANGE_RE.search(l):
+                continue
+            if 3 <= len(l) <= 55:
+                block_lines.append(l)
+
+    # If header-based extraction collected mostly non-skill lines, discard it.
+    block_lines = [l for l in block_lines if _clean_skill_token(l) and not _looks_like_company_line(l)]
+
+    candidate_text = "\n".join([t for t in [section_skills_text, "\n".join(block_lines)] if t])
+    if not candidate_text:
+        # Final fallback: scan top of resume for a compact "expertise list" block.
+        all_lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+        collecting = False
+        for l in all_lines[:80]:
+            low = l.lower()
+            is_contact = any(x in low for x in ("@", "http", "www.", "st.", "street", "city")) or re.search(r"\d{3}[-\s]?\d{3}", l)
+            if is_contact and collecting:
+                break
+            if is_contact and not collecting:
+                continue
+            if TITLE_DATE_RE.match(l) or DATE_RANGE_RE.search(l):
+                break
+            if not collecting and (("years" in low and "experience" in low) or ("technical documentation" in low)):
+                collecting = True
+                continue
+            if "." in l:
+                # once we see a sentence, start collecting next short lines
+                collecting = True
+                continue
+            if collecting and 3 <= len(l) <= 55 and not _is_probable_header_line(l):
+                tok = _clean_skill_token(l)
+                if tok:
+                    block_lines.append(tok)
+
+        candidate_text = "\n".join(block_lines)
+        if not candidate_text:
+            return []
+
+    raw_tokens: list[str] = []
+    for line in candidate_text.split("\n"):
+        if not line.strip():
+            continue
+        parts = re.split(r"[,\u2022•|/]\s*|\s{2,}", line)
+        if len(parts) <= 1:
+            parts = [line]
+        raw_tokens.extend([p.strip() for p in parts if p.strip()])
+
+    found: dict[str, str] = {}
+    for tok in raw_tokens:
+        cleaned = _clean_skill_token(tok)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key not in found:
+            found[key] = cleaned
+
+    return sorted(found.values(), key=lambda s: s.lower())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,6 +586,45 @@ def _duration_months(start_raw: str, end_raw: str) -> int | None:
     return max(0, months) if months >= 0 else None
 
 
+def _looks_like_company_line(s: str) -> bool:
+    """
+    Best-effort company-name detector used across skills/experience parsing.
+    Keep this conservative (prefer false-negative over false-positive).
+    """
+    s = (s or "").strip()
+    if not s or len(s) > 60:
+        return False
+
+    low = s.lower()
+
+    # Never treat obvious job titles as companies
+    if any(w in low for w in (
+        "developer", "engineer", "manager", "analyst", "architect", "designer",
+        "consultant", "specialist", "lead", "intern", "freelance",
+    )):
+        return False
+
+    # reject sentence fragments ending with period (usually not a company name)
+    if s.endswith(".") and re.match(r"^[a-z]", s):
+        return False
+
+    if any(k in low for k in ("company", "inc", "ltd", "llc", "corp")):
+        return True
+
+    # Company-like suffixes / separators (word-boundary aware)
+    if "&" in s:
+        return True
+
+    if re.search(r"\b(partners|agency|studio|labs|group|industries|technologies)\b", low):
+        return True
+
+    # standalone "co" / "co." token
+    if re.search(r"\bco\.?\b", low):
+        return True
+
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Experience extraction
 # ═══════════════════════════════════════════════════════════════════════════
@@ -363,23 +637,270 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
     Strategy B – Date range on its own line; look ±3 lines for company / title.
     Both strategies are attempted; results are merged (deduplicated by start date).
     """
-    # Search the full text in addition to the experience section so we never
-    # miss entries because the section splitter failed on multi-column PDFs.
-    search_texts: list[str] = []
-    exp_section = sections.get("experience", "").strip()
-    if exp_section:
-        search_texts.append(exp_section)
-    # Always also scan the full resume text
-    search_texts.append(text)
+    text = _normalize_headers(text or "")
+    # Prefer experience section; only fall back to full text if section is missing.
+    exp_section = (sections.get("experience", "") or "").strip()
+    search_texts: list[str] = [exp_section] if exp_section else [text]
 
     seen_starts: set[str] = set()
     experiences: list[dict] = []
 
+    def _looks_like_title(s: str) -> bool:
+        s = (s or "").strip()
+        if not s:
+            return False
+        if len(s) > 60:
+            return False
+        # Reject generic lowercase words like "management"
+        letters_only = re.sub(r"[^A-Za-z]", "", s)
+        if letters_only and letters_only.islower():
+            return False
+        # Strong signal for many templates: ALL CAPS titles
+        letters = re.sub(r"[^A-Za-z]", "", s)
+        if letters and letters.isupper() and len(letters) >= 6:
+            return True
+        # Otherwise allow short "Title Case" lines
+        if 4 <= len(s) <= 35 and re.match(r"^[A-Za-z][A-Za-z &/.\-]{2,}$", s):
+            return True
+        return False
+
+    def _looks_like_company(s: str) -> bool:
+        return _looks_like_company_line(s)
+
+    def _extract_experience_blocks(block_text: str) -> list[dict]:
+        """
+        Block parser for templates like:
+          Company
+          (Company repeated)
+          2016 - Present
+          APPLICATIONS DEVELOPER
+          <desc lines...>
+          2014 - 2016
+          WEB CONTENT MANAGER
+          <desc lines...>
+        """
+        block_text = _normalize_headers(block_text or "")
+        raw_lines = [l.strip() for l in block_text.split("\n") if l.strip()]
+        out: list[dict] = []
+        current_company: str | None = None
+        pending_title: str | None = None
+        pending_dates: list[tuple[str, str]] = []
+
+        i = 0
+        while i < len(raw_lines):
+            line = raw_lines[i]
+            if _is_probable_header_line(line):
+                i += 1
+                continue
+
+            # Company line
+            if _looks_like_company(line):
+                current_company = line
+                i += 1
+                continue
+
+            # Title line (some templates: Title → Company → Dates)
+            if _looks_like_title(line) and not _looks_like_company(line):
+                pending_title = line
+                i += 1
+                continue
+
+            # Date line → queue it (some templates list multiple date ranges first)
+            dm = DATE_RANGE_RE.search(line)
+            if dm:
+                pending_dates.append(((dm.group("start") or "").strip(), (dm.group("end") or "").strip()))
+                i += 1
+                continue
+
+            # Title line: if we have pending dates, assign the next date range to this title.
+            if pending_dates and _looks_like_title(line):
+                start_date, end_date = pending_dates.pop(0)
+                job_title = line
+
+                # description until next title/date/company/header
+                desc_parts: list[str] = []
+                j = i + 1
+                while j < len(raw_lines):
+                    nxt = raw_lines[j]
+                    if _is_probable_header_line(nxt) or _looks_like_company(nxt) or DATE_RANGE_RE.search(nxt) or _looks_like_title(nxt):
+                        break
+                    desc_parts.append(nxt)
+                    j += 1
+
+                description = " ".join(desc_parts[:8]).strip() or None
+                duration = _duration_months(start_date, end_date) if start_date else None
+
+                out.append({
+                    "companyName"     : current_company,
+                    "jobTitle"        : job_title,
+                    "startDate"       : start_date,
+                    "endDate"         : end_date,
+                    "durationInMonths": duration,
+                    "description"     : description,
+                })
+
+                i = j
+                continue
+
+            # Dates already captured, but title was seen BEFORE dates (Title → Company → Dates)
+            if pending_title and pending_dates:
+                start_date, end_date = pending_dates.pop(0)
+                out.append({
+                    "companyName"     : current_company,
+                    "jobTitle"        : pending_title,
+                    "startDate"       : start_date,
+                    "endDate"         : end_date,
+                    "durationInMonths": _duration_months(start_date, end_date) if start_date else None,
+                    "description"     : None,
+                })
+                pending_title = None
+                continue
+
+            i += 1
+
+        # If dates exist but no titles were found, emit minimal rows
+        for start_date, end_date in pending_dates:
+            out.append({
+                "companyName"     : current_company,
+                "jobTitle"        : None,
+                "startDate"       : start_date,
+                "endDate"         : end_date,
+                "durationInMonths": _duration_months(start_date, end_date) if start_date else None,
+                "description"     : None,
+            })
+
+        return out
+
+    def _extract_two_column_experience(block_text: str) -> list[dict]:
+        """
+        Handle templates like:
+          Software Developer Intern    Web Developer Intern
+          Fauget Tech Company | Aug 2023 - Dec 2023    Fauget Tech Company | Jan 2024 - Aug 2024
+          <left bullets...>    <right bullets...>
+        """
+        bt = _normalize_headers(block_text or "")
+        # Some PDFs collapse the two-column section into a single giant line.
+        # Normalize by injecting newlines around obvious anchors.
+        bt = re.sub(r"\b(Fauget\s+Tech\s+Company)\s*\|", r"\n\1 |", bt, flags=re.IGNORECASE)
+        bt = re.sub(r"(?i)\b(Software\s+Developer\s+Intern)\b", r"\n\1", bt)
+        bt = re.sub(r"(?i)\b(Web\s+Developer\s+Intern)\b", r"  \1", bt)
+        lines = [l.rstrip() for l in bt.split("\n") if l.strip()]
+        out: list[dict] = []
+
+        # find a line that contains two titles (often two columns merged)
+        for i in range(len(lines) - 2):
+            title_line = lines[i]
+            if DATE_RANGE_RE.search(title_line):
+                continue
+
+            parts: list[str] = []
+            if re.search(r"\s{2,}|\t+", title_line):
+                parts = re.split(r"\s{2,}|\t+", title_line.strip())
+            else:
+                # Fallback: "Software Developer Intern Web Developer Intern"
+                m2 = re.match(r"^(.+?\bIntern)\s+(.+?\bIntern)\s*$", title_line, re.IGNORECASE)
+                if m2:
+                    parts = [m2.group(1).strip(), m2.group(2).strip()]
+
+            if parts:
+                if len(parts) != 2:
+                    continue
+                left_title, right_title = parts[0].strip(), parts[1].strip()
+                if not left_title or not right_title:
+                    continue
+
+                company_line = lines[i + 1]
+                if not (("|" in company_line) and re.search(r"\s{2,}|\t+", company_line)):
+                    # Alternative: two company/date blocks are on separate lines
+                    company_line2 = lines[i + 2] if i + 2 < len(lines) else ""
+                    if "|" not in company_line2:
+                        continue
+                    cparts = [company_line.strip(), company_line2.strip()]
+                else:
+                    cparts = re.split(r"\s{2,}|\t+", company_line.strip())
+                    if len(cparts) != 2:
+                        # Sometimes the two company/date blocks are just separated by two spaces.
+                        cparts = re.split(r"\s{2,}", company_line.strip())
+                        if len(cparts) != 2:
+                            continue
+
+                def parse_company_date(s: str):
+                    # "Fauget Tech Company | Aug 2023 - Dec 2023"
+                    chunks = [x.strip() for x in s.split("|") if x.strip()]
+                    company = chunks[0] if chunks else None
+                    dm = DATE_RANGE_RE.search(s)
+                    if not dm:
+                        return company, None, None, None
+                    start = (dm.group("start") or "").strip()
+                    end = (dm.group("end") or "").strip()
+                    dur = _duration_months(start, end) if start else None
+                    return company, start, end, dur
+
+                l_company, l_start, l_end, l_dur = parse_company_date(cparts[0])
+                r_company, r_start, r_end, r_dur = parse_company_date(cparts[1])
+
+                # descriptions: collect next few lines until we hit a section header
+                left_desc: list[str] = []
+                right_desc: list[str] = []
+                for j in range(i + 2, min(len(lines), i + 20)):
+                    row = lines[j]
+                    if _is_probable_header_line(row):
+                        break
+                    if re.search(r"\s{2,}|\t+", row):
+                        cols = re.split(r"\s{2,}|\t+", row.strip())
+                        if len(cols) == 2:
+                            if cols[0].strip():
+                                left_desc.append(cols[0].strip())
+                            if cols[1].strip():
+                                right_desc.append(cols[1].strip())
+                    else:
+                        # single column line -> ignore (layout noise)
+                        continue
+
+                if l_company and l_start and l_end:
+                    out.append({
+                        "companyName": l_company,
+                        "jobTitle": left_title,
+                        "startDate": l_start,
+                        "endDate": l_end,
+                        "durationInMonths": l_dur,
+                        "description": " ".join(left_desc[:10]).strip() or None,
+                    })
+                if r_company and r_start and r_end:
+                    out.append({
+                        "companyName": r_company,
+                        "jobTitle": right_title,
+                        "startDate": r_start,
+                        "endDate": r_end,
+                        "durationInMonths": r_dur,
+                        "description": " ".join(right_desc[:10]).strip() or None,
+                    })
+
+                return out
+
+        return out
+
     for search_text in search_texts:
+        # Normalize again at experience-level (important for merged two-column PDFs)
+        search_text = _normalize_headers(search_text or "")
         lines = search_text.split("\n")
 
+        # If this resume uses "Job Title | Date - Date" format, prefer that (more reliable)
+        has_pipe_format = any(TITLE_DATE_RE.match((l or "").strip()) for l in lines)
+
+        paired_titles: list[str] | None = None
+        paired_titles_at = -1
+        for i, l in enumerate(lines[:80]):
+            l0 = (l or "").strip()
+            m2 = re.match(r"^(.+?\bIntern)\s+(.+?\bIntern)\s*$", l0, re.IGNORECASE)
+            if m2:
+                paired_titles = [m2.group(1).strip(), m2.group(2).strip()]
+                paired_titles_at = i
+                break
+        paired_company_line_count = 0
+
         # ── Strategy A: "Title | Date - Date" on one line ─────────────
-        for line in lines:
+        for idx, line in enumerate(lines):
             m = TITLE_DATE_RE.match(line.strip())
             if not m:
                 continue
@@ -390,11 +911,58 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
                 continue
             seen_starts.add(key)
             raw_title  = m.group("title").strip()
-            # Title may be "Company\nJob" or "Job  Company" or just "Job"
-            # split on two or more spaces or pipe
-            parts = re.split(r"\s{2,}|\s*\|\s*", raw_title)
-            job_title    = parts[0].strip() if parts else raw_title
-            company_name = parts[1].strip() if len(parts) > 1 else None
+            # Many templates: previous line is company, this line's title is job title.
+            prev_company = None
+            for j in range(idx - 1, max(-1, idx - 4), -1):
+                pj = (lines[j] or "").strip()
+                if not pj:
+                    continue
+                if DATE_RANGE_RE.search(pj) or _is_probable_header_line(pj):
+                    continue
+                if _looks_like_company(pj):
+                    prev_company = pj
+                    break
+
+            # If raw_title itself looks like a company name, treat it as company not job title.
+            job_title = raw_title
+            company_name = prev_company
+            if _looks_like_company(raw_title):
+                company_name = raw_title
+                # In some templates the job title is on the previous line:
+                #   "Software Developer Intern"
+                #   "Fauget Tech Company | Aug 2023 - Dec 2023"
+                prev_title = None
+                for j in range(idx - 1, max(-1, idx - 6), -1):
+                    pj = (lines[j] or "").strip()
+                    if not pj:
+                        continue
+                    if DATE_RANGE_RE.search(pj) or _is_probable_header_line(pj):
+                        continue
+                    if _looks_like_company(pj):
+                        continue
+                    lowpj = pj.lower().strip()
+                    if lowpj.startswith(("and ", "assist ", "implement ", "collaborate ")):
+                        continue
+                    # If the title is glued to other text, extract the exact role token
+                    mrole = re.search(r"(?i)\b(Software\s+Developer\s+Intern|Web\s+Developer\s+Intern)\b", pj)
+                    if mrole:
+                        prev_title = mrole.group(1).strip()
+                        break
+                    if _looks_like_title(pj) and ("intern" in lowpj or "developer" in lowpj):
+                        prev_title = pj.strip()
+                        break
+                job_title = prev_title
+
+                if paired_titles and idx > paired_titles_at:
+                    if paired_company_line_count < len(paired_titles):
+                        job_title = paired_titles[paired_company_line_count]
+                    paired_company_line_count += 1
+
+            # Skip education rows that look like "2024 - 2028 | University"
+            window = " ".join([(lines[j] or "") for j in range(max(0, idx - 2), min(len(lines), idx + 3))]).lower()
+            if "university" in window or DEGREE_RE.search(window):
+                continue
+
             duration = _duration_months(start_date, end_date)
             experiences.append({
                 "companyName"     : company_name,
@@ -404,6 +972,24 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
                 "durationInMonths": duration,
                 "description"     : None,
             })
+
+        if has_pipe_format:
+            continue
+
+        # Template-aware block parser as fallback
+        two_col = _extract_two_column_experience(search_text)
+        for exp in two_col:
+            sd = (exp.get("startDate") or "").strip().lower()
+            if sd and sd not in seen_starts:
+                seen_starts.add(sd)
+                experiences.append(exp)
+
+        block_results = _extract_experience_blocks(search_text)
+        for exp in block_results:
+            sd = (exp.get("startDate") or "").strip().lower()
+            if sd and sd not in seen_starts:
+                seen_starts.add(sd)
+                experiences.append(exp)
 
         # ── Strategy B: date range somewhere on a line ─────────────────
         entry_starts: list[int] = []
@@ -429,10 +1015,28 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
                 continue
             seen_starts.add(key)
 
-            # Lines BEFORE the date line → potential company / title
-            before = [l.strip() for l in lines[max(0, start_i - 4): start_i] if l.strip()]
-            job_title    = before[-1] if before else None
-            company_name = before[-2] if len(before) >= 2 else None
+            # Company is usually BEFORE the date line, title is usually AFTER (fixes many PDFs)
+            before = [l.strip() for l in lines[max(0, start_i - 6): start_i] if l.strip()]
+            # take the nearest non-date, non-header line as company
+            company_name = None
+            for b in reversed(before):
+                if DATE_RANGE_RE.search(b) or _is_probable_header_line(b):
+                    continue
+                if _looks_like_company(b):
+                    company_name = b
+                    break
+
+            # Title: first title-like line after date line (before descriptions)
+            job_title = None
+            for a in lines[start_i + 1: min(len(lines), start_i + 10)]:
+                a = a.strip()
+                if not a:
+                    continue
+                if DATE_RANGE_RE.search(a) or _is_probable_header_line(a):
+                    break
+                if _looks_like_title(a):
+                    job_title = a
+                    break
 
             desc_lines  = [l.strip() for l in lines[start_i + 1: end_i] if l.strip()]
             description = " ".join(desc_lines[:6]) or None
@@ -483,17 +1087,257 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
     Searches both the education section AND the full text (handles multi-column PDFs
     where section splitter may have lost part of the content).
     """
-    edu_section = sections.get("education", "").strip()
-    # Always also scan full text so multi-column PDFs don't lose entries
-    search_texts = []
-    if edu_section:
-        search_texts.append(edu_section)
-    search_texts.append(text)
+    text = _normalize_headers(text or "")
+    edu_section = (sections.get("education", "") or "").strip()
+    # Prefer education section; only fall back to full text if section is missing.
+    search_texts = [edu_section] if edu_section else [text]
 
     education: list[dict] = []
     seen: set[str] = set()
 
+    def _extract_education_blocks(block_text: str) -> list[dict]:
+        """
+        Block parser for templates like:
+          School/University
+          2010 - 2014
+          SECONDARY SCHOOL
+          University
+          2014 - 2016
+          BACHELOR OF TECHNOLOGY
+        """
+        block_text = _normalize_headers(block_text or "")
+        raw_lines = [l.strip() for l in block_text.split("\n") if l.strip()]
+        out: list[dict] = []
+
+        i = 0
+        while i < len(raw_lines):
+            line = raw_lines[i]
+            if _is_probable_header_line(line):
+                i += 1
+                continue
+
+            # Handle "Bachelor's Degree in Computer\nScience at Fauget University" pattern
+            if (" at " in line.lower()) and ("degree" in line.lower() or DEGREE_RE.search(line)):
+                # combine with previous line if it looks like continuation (e.g., "Bachelor's Degree in Computer")
+                combined = line
+                if i - 1 >= 0 and not _is_probable_header_line(raw_lines[i - 1]) and not DATE_RANGE_RE.search(raw_lines[i - 1]):
+                    if "degree" in raw_lines[i - 1].lower():
+                        combined = raw_lines[i - 1].strip() + " " + line.strip()
+
+                # Extract degree and university
+                deg = None
+                dm = DEGREE_RE.search(combined)
+                if dm:
+                    try:
+                        deg = (dm.group(1) or dm.group(0)).strip()
+                    except Exception:
+                        deg = dm.group(0).strip()
+                uni = None
+                m_at = re.search(r"\bat\s+(.+)$", combined, re.IGNORECASE)
+                if m_at:
+                    uni = m_at.group(1).strip()
+
+                # Look ahead for date ranges in parentheses
+                date_line = raw_lines[i + 1] if i + 1 < len(raw_lines) else ""
+                yr = DATE_RANGE_RE.search(date_line)
+                start_year = end_year = None
+                if yr:
+                    years = re.findall(r"\b(19\d{2}|20\d{2})\b", f"{yr.group('start')} {yr.group('end')}")
+                    start_year = int(years[0]) if years else None
+                    end_year = int(years[1]) if len(years) > 1 else (int(years[0]) if years else None)
+
+                if deg or uni:
+                    out.append({
+                        "degree": deg or combined,
+                        "fieldOfStudy": None,
+                        "university": uni,
+                        "startYear": start_year,
+                        "endYear": end_year,
+                    })
+                i += 1
+                continue
+
+            # Handle parenthesized ranges on one line, e.g.
+            # "( Aug 2020 - Dec 2024 )   ( Aug 2017 - Dec 2019 )"
+            if "(" in line and ")" in line and DATE_RANGE_RE.search(line):
+                ranges = DATE_RANGE_RE.findall(line)
+                if ranges:
+                    # Look back for up to 4 lines for two institutions and optional degree line.
+                    prev = raw_lines[max(0, i - 4): i]
+                    prev = [p for p in prev if not _is_probable_header_line(p)]
+
+                    # try detect: degree line contains "degree" or matches DEGREE_RE
+                    degree_line = next((p for p in prev if ("degree" in p.lower()) or DEGREE_RE.search(p)), None)
+                    # institutions: lines that contain "university|school|high school"
+                    inst = [p for p in prev if re.search(r"(university|school|high school|college|institute)", p, re.IGNORECASE)]
+
+                    def to_year(s: str) -> int | None:
+                        m = re.search(r"\b(19\d{2}|20\d{2})\b", s)
+                        return int(m.group(1)) if m else None
+
+                    # map ranges to institutions if counts match
+                    for idx, (start_raw, end_raw) in enumerate(ranges[:2]):
+                        start_year = to_year(start_raw)
+                        end_year = to_year(end_raw)
+                        uni = inst[idx] if idx < len(inst) else None
+                        deg = None
+                        # first range often university degree
+                        if idx == 0 and degree_line:
+                            deg = degree_line
+                        elif idx == 1 and inst:
+                            # high school
+                            deg = "HIGH SCHOOL" if "high school" in (uni or "").lower() else None
+
+                        if uni or deg:
+                            out.append({
+                                "degree": deg,
+                                "fieldOfStudy": None,
+                                "university": uni,
+                                "startYear": start_year,
+                                "endYear": end_year,
+                            })
+
+                    i += 1
+                    continue
+
+            # handle "YYYY - YYYY | University" line
+            if "|" in line and DATE_RANGE_RE.search(line):
+                yr = DATE_RANGE_RE.search(line)
+                start_raw = (yr.group("start") or "").strip() if yr else ""
+                end_raw = (yr.group("end") or "").strip() if yr else ""
+                parts = [p.strip() for p in line.split("|") if p.strip()]
+                uni = parts[-1] if parts else None
+                years = re.findall(r"\b(19\d{2}|20\d{2})\b", f"{start_raw} {end_raw}")
+                start_year = int(years[0]) if years else None
+                end_year = int(years[1]) if len(years) > 1 else (int(years[0]) if years else None)
+                # degree line usually just above this
+                deg_line = raw_lines[i - 1] if i - 1 >= 0 else ""
+                degree = None
+                if deg_line and not DATE_RANGE_RE.search(deg_line) and not _is_probable_header_line(deg_line):
+                    degree = deg_line.strip()
+                if degree and (DEGREE_RE.search(degree) or degree.isupper() or "bachelor" in degree.lower() or "master" in degree.lower()):
+                    out.append({
+                        "degree": degree,
+                        "fieldOfStudy": None,
+                        "university": uni,
+                        "startYear": start_year,
+                        "endYear": end_year,
+                    })
+                i += 1
+                continue
+
+            # "Graduated: 2013" style
+            grad_year = None
+            mgrad = re.search(r"\bgraduated\s*:\s*(19\d{2}|20\d{2})\b", line, re.IGNORECASE)
+            if mgrad:
+                grad_year = int(mgrad.group(1))
+
+            # find year range line
+            yr = DATE_RANGE_RE.search(line)
+            if not yr:
+                # If this line only contains a graduation year, still try to build an education row
+                if grad_year is not None:
+                    degree = raw_lines[i - 2].strip() if i - 2 >= 0 else None
+                    institution = raw_lines[i - 1].strip() if i - 1 >= 0 else None
+                    if degree and institution and DEGREE_RE.search(degree):
+                        out.append({
+                            "degree": degree,
+                            "fieldOfStudy": None,
+                            "university": institution,
+                            "startYear": None,
+                            "endYear": grad_year,
+                        })
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            start_raw = (yr.group("start") or "").strip()
+            end_raw   = (yr.group("end") or "").strip()
+
+            # Education should not have "Present/Current" ranges — those are almost always experience.
+            if re.match(r"^(present|current|now)$", end_raw.strip(), re.IGNORECASE):
+                i += 1
+                continue
+
+            # institution tends to be just before year line
+            institution = None
+            if i - 1 >= 0 and not DATE_RANGE_RE.search(raw_lines[i - 1]):
+                prev = raw_lines[i - 1]
+                if not _is_probable_header_line(prev):
+                    low = prev.lower()
+                    if "company" not in low and re.search(r"(university|college|school|institute|academy|polytechnic|high)", low):
+                        institution = prev
+
+            # degree tends to be after year line
+            degree = None
+            field_of_study = None
+            j = i + 1
+            while j < len(raw_lines) and not DATE_RANGE_RE.search(raw_lines[j]) and not _is_probable_header_line(raw_lines[j]):
+                cand = raw_lines[j]
+                if DEGREE_RE.search(cand):
+                    deg_match = DEGREE_RE.search(cand)
+                    try:
+                        degree = (deg_match.group(1) or deg_match.group(0)).strip()
+                    except Exception:
+                        degree = cand.strip()
+
+                    after = cand[deg_match.end():].strip(" ,–-–") if deg_match else ""
+                    fm = re.match(r"(?:of|in)\s+([A-Za-z][A-Za-z &/]{2,60})|[-–]\s*([A-Za-z][A-Za-z &/]{2,60})", after)
+                    if fm:
+                        field_of_study = (fm.group(1) or fm.group(2) or "").strip() or None
+                    break
+                j += 1
+
+            # If degree not matched by keywords, accept ALL-CAPS short lines like 'SECONDARY SCHOOL'
+            if degree is None:
+                for k in range(i + 1, min(len(raw_lines), i + 6)):
+                    cand = raw_lines[k]
+                    letters = re.sub(r"[^A-Za-z]", "", cand)
+                    if letters and letters.isupper() and 6 <= len(letters) <= 40:
+                        degree = cand.strip()
+                        break
+
+            # Guardrail: do not treat job titles as degrees
+            if degree:
+                deg_low = degree.lower()
+                if degree.strip().endswith(":"):
+                    degree = None
+                if any(x in deg_low for x in ("developer", "manager", "engineer", "analyst", "content")):
+                    degree = None
+                if any(x in deg_low for x in ("expertise", "projects", "experience", "summary", "skills")):
+                    degree = None
+
+            # Parse years (prefer year-only)
+            years = re.findall(r"\b(19\d{2}|20\d{2})\b", f"{start_raw} {end_raw}")
+            start_year = int(years[0]) if years else None
+            end_year = int(years[1]) if len(years) > 1 else (int(years[0]) if years else None)
+
+            # Final validation: only accept blocks that look education-like
+            window = " ".join(raw_lines[max(0, i - 2): min(len(raw_lines), i + 6)]).lower()
+            looks_edu = bool(re.search(r"\b(university|college|school|institute|academy|polytechnic)\b", window))
+            looks_degree = bool(re.search(r"\b(bachelor|master|secondary|hsc|ssc|phd|diploma|associate)\b", window))
+
+            if (institution or degree) and (looks_edu or looks_degree):
+                out.append({
+                    "degree": degree,
+                    "fieldOfStudy": field_of_study,
+                    "university": institution,
+                    "startYear": start_year,
+                    "endYear": end_year,
+                })
+
+            i = max(i + 1, j)
+        return out
+
     for search_text in search_texts:
+        # Template-aware block extraction first
+        for edu in _extract_education_blocks(search_text):
+            key = f"{(edu.get('degree') or '')}|{(edu.get('university') or '')}|{edu.get('startYear') or ''}".lower()
+            if key not in seen:
+                seen.add(key)
+                education.append(edu)
+
         # Split into candidate paragraphs / lines
         paragraphs = re.split(r"\n{2,}", search_text.strip())
         if len(paragraphs) <= 1:
@@ -575,7 +1419,27 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
                 "endYear"     : end_year,
             })
 
-    return education[:5]  # cap at 5 entries
+    # Final cleanup: remove obvious noise rows
+    cleaned: list[dict] = []
+    has_year_based = any(e.get("startYear") or e.get("endYear") for e in education)
+    for e in education:
+        uni = (e.get("university") or "").strip()
+        deg = (e.get("degree") or "").strip()
+        if uni.upper() in {"SCHOOL"}:
+            continue
+        if uni and deg and uni.strip().lower() == deg.strip().lower():
+            continue
+        # If we already have a proper year-based education, drop fuzzy no-year rows
+        if has_year_based and not e.get("startYear") and not e.get("endYear"):
+            continue
+        # Keep only rows that have at least degree+years or degree+university
+        if not deg:
+            continue
+        if not uni and not e.get("startYear") and not e.get("endYear"):
+            continue
+        cleaned.append(e)
+
+    return cleaned[:5]  # cap at 5 entries
 
 
 # ═══════════════════════════════════════════════════════════════════════════

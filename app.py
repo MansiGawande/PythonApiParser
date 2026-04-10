@@ -87,6 +87,8 @@ DEGREE_KEYWORDS = [
     r"bachelor[s]?\s+(?:of\s+)?(?:science|arts|technology|engineering|commerce|computer)",
     r"b\.?\s*(?:tech|eng|sc|com|arch|ca)\.?",
     r"m\.?\s*(?:tech|eng|sc|com|phil|ba|ca)\.?",
+    r"b\.?\s*s\.?",
+    r"m\.?\s*s\.?",
     r"mba|pgdm",
     r"b\.com\b",
     r"diploma(?:\s+in)?",
@@ -116,6 +118,7 @@ SECTION_PATTERNS = {
     ),
     "education": re.compile(
         r"^education(?:al\s+(?:background|qualification)s?)?"
+        r"|^educational\s+history"
         r"|^academic(?:\s+background)?"
         r"|^qualifications?"
         r"|^academic\s+credentials?",
@@ -136,6 +139,7 @@ SECTION_PATTERNS = {
     # "CAREER SUMMARY:", "Professional Summary", "About Me", "Objective", etc.
     "summary": re.compile(
         r"^(?:career\s+)?summary"
+        r"|^personal\s+profile"
         r"|^(?:professional\s+)?(?:profile|overview)"
         r"|^objective"
         r"|^about(?:\s+me)?"
@@ -185,7 +189,7 @@ def _detect_section_header(line: str) -> str | None:
     norm = re.sub(r"[:\-–—]+$", "", s).strip().lower()
 
     # explicit keyword mapping (format-independent)
-    if re.search(r"\b(areas?\s+of\s+expertise|technical\s+expertise|core\s+competencies|tools|technologies)\b", norm):
+    if re.search(r"\b(skills?\s+(?:and|&)\s+expertise|areas?\s+of\s+expertise|technical\s+expertise|core\s+competencies|tools|technologies)\b", norm):
         return "skills"
     if re.search(r"\b(professional\s+experience|work\s+experience|employment\s+history|work\s+history)\b", norm):
         return "experience"
@@ -206,12 +210,12 @@ _MONTH_NAMES = (
 )
 # Matches "04 February, 2029", "February 2029", "Feb 2029", or just "2029"
 _DATE_PART = (
-    rf"(?:\d{{1,2}}\s+)?(?:{_MONTH_NAMES})[.,]?\s*\d{{4}}"
+    rf"(?:\d{{1,2}},?\s+)?(?:{_MONTH_NAMES})[.,]?\s*\d{{4}}"
     r"|\d{4}"
 )
 DATE_RANGE_RE = re.compile(
     rf"(?P<start>{_DATE_PART})"
-    r"\s*[-–—|]+\s*"
+    r"\s*[-–—|~�\uFFFD]+\s*"
     rf"(?P<end>{_DATE_PART}|present|current|now)",
     re.IGNORECASE,
 )
@@ -219,9 +223,63 @@ DATE_RANGE_RE = re.compile(
 # Also match "Title | Date" single-entry lines like "Web Developer | 04 Feb, 2029 - Present"
 TITLE_DATE_RE = re.compile(
     r"^(?P<title>[^|]+?)\s*\|\s*"
-    rf"(?P<start>{_DATE_PART})\s*[-–—]+\s*(?P<end>{_DATE_PART}|present|current|now)",
+    rf"(?P<start>{_DATE_PART})\s*[-–—~�\uFFFD]+\s*(?P<end>{_DATE_PART}|present|current|now)",
     re.IGNORECASE,
 )
+
+# Education: reject lines that are employment timelines misread as "university"
+_EDU_UNIVERSITY_KW_RE = re.compile(
+    r"\b(university|college|institute|academy|polytechnic|conservatory)\b|\bhigh\s+school\b",
+    re.IGNORECASE,
+)
+_EDU_UNIVERSITY_TITLE_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z\s&'.-]{2,80}\s+University\b",
+    re.IGNORECASE,
+)
+
+
+def _text_looks_like_date_span_only(s: str) -> bool:
+    """True if the string is essentially a date range (not an institution name)."""
+    s = (s or "").strip()
+    if not s:
+        return True
+    if len(s) > 140:
+        return False
+    if not DATE_RANGE_RE.search(s):
+        return False
+    t = DATE_RANGE_RE.sub(" ", s)
+    t = re.sub(
+        rf"\b(?:{_MONTH_NAMES})\b\.?",
+        " ",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"\d{1,4}", " ", t)
+    t = re.sub(r"[-–—,|]+", " ", t)
+    t = re.sub(r"\bpresent\b|\bcurrent\b|\bnow\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return len(t) < 4
+
+
+def _is_plausible_education_university(s: str | None) -> bool:
+    if not s or not str(s).strip():
+        return False
+    s = str(s).strip()
+    if _text_looks_like_date_span_only(s):
+        return False
+    if _EDU_UNIVERSITY_KW_RE.search(s):
+        return True
+    if _EDU_UNIVERSITY_TITLE_RE.search(s):
+        return True
+    return False
+
+
+def _pipe_segment_is_institution_name(seg: str) -> bool:
+    seg = (seg or "").strip()
+    if not seg or _text_looks_like_date_span_only(seg):
+        return False
+    return _is_plausible_education_university(seg)
+
 
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
@@ -292,6 +350,7 @@ def _normalize_headers(text: str) -> str:
     text = re.sub(r"([A-Za-z])(\d)", r"\1\n\2", text)
     # Replace common bad dash glyphs / replacement chars
     text = text.replace("\uFFFD", "-")
+    text = text.replace("�", "-")
     # "2013Master" -> "2013\nMaster"
     text = re.sub(r"(\d{4})(?=[A-Z])", r"\1\n", text)
 
@@ -376,7 +435,7 @@ def _is_probable_header_line(line: str) -> bool:
     if _detect_section_header(s) is not None:
         return True
     norm = re.sub(r"[:\-–—]+$", "", s).strip().lower()
-    return norm in ("profile", "contact", "summary")
+    return norm in ("profile", "personal profile", "contact", "contact details", "summary", "languages")
 
 
 def _clean_skill_token(token: str) -> str | None:
@@ -395,8 +454,9 @@ def _clean_skill_token(token: str) -> str | None:
     # Drop plain domains
     if re.search(r"\b[a-z0-9.-]+\.[a-z]{2,}\b", t, re.IGNORECASE):
         return None
-    # Drop standalone headers
-    if t.strip().upper() in {"PROFILE", "CONTACT", "SUMMARY", "EXPERIENCE", "EDUCATION", "SKILLS"}:
+    # Drop standalone headers (with or without trailing colon)
+    _hdr = re.sub(r"[:\-–—\s]+$", "", t.strip(), flags=re.IGNORECASE).upper()
+    if _hdr in {"PROFILE", "CONTACT", "SUMMARY", "EXPERIENCE", "EDUCATION", "SKILLS"}:
         return None
     if re.search(r"\b\d{3}[-\s]?\d{3}[-\s]?\d{4}\b", t):
         return None
@@ -414,10 +474,112 @@ def _clean_skill_token(token: str) -> str | None:
 # Skills extraction
 # ═══════════════════════════════════════════════════════════════════════════
 
+_JOB_TITLE_AS_SKILL_RE = re.compile(
+    r"^(?:web|software|frontend|front[- ]end|backend|back[- ]end|full[- ]?stack|senior|junior|"
+    r"mid[- ]?level|lead|principal|staff|associate)\s+"
+    r"(?:developer|engineer|designer|architect|consultant|analyst|programmer)"
+    r"(?:\s+intern)?$",
+    re.IGNORECASE,
+)
+
+
+def _skills_header_line_kind(line: str) -> str | None:
+    """Return 'skills' or 'areas' if the line is a skills-section header; else None."""
+    s = re.sub(r"[:\-–—\s]+$", "", (line or "").strip(), flags=re.IGNORECASE).upper()
+    if s == "SKILLS":
+        return "skills"
+    if s.startswith("SKILLS AND EXPERTISE") or s.startswith("SKILLS & EXPERTISE"):
+        return "skills"
+    if s.startswith("AREAS OF EXPERTISE"):
+        return "areas"
+    return None
+
+
+_LANG_LINE_RE = re.compile(
+    r"^(?:english|french|spanish|hindi|marathi|german|arabic|japanese|korean|mandarin|portuguese|italian)"
+    r"(?:\s*\([^)]+\))?$",
+    re.IGNORECASE,
+)
+
+
+def _collect_lines_after_skills_header(lines: list[str], i0: int, max_lines: int = 60) -> list[str]:
+    """Lines below SKILLS / AREAS OF EXPERTISE until the next section or contact-like row."""
+    out: list[str] = []
+    for j in range(i0 + 1, min(len(lines), i0 + 1 + max_lines)):
+        lj = (lines[j] or "").strip()
+        if not lj:
+            continue
+        upper_lj = lj.strip().upper()
+        if upper_lj in {"LANGUAGES", "CONTACT", "CONTACT DETAILS"}:
+            continue
+        if _is_probable_header_line(lj):
+            break
+        if _LANG_LINE_RE.match(lj.strip()):
+            continue
+        low = lj.lower()
+        # Avoid matching " st" inside words like "structure" / "infrastructure".
+        if any(x in low for x in ("@", "http", "www.", " street", " city", "site.com")):
+            continue
+        if re.search(r"\b(?:st\.|st)\b", low) and re.search(r"\d", lj):
+            continue
+        if re.search(r"\d{3}[-\s]?\d{3}", lj):
+            continue
+        if TITLE_DATE_RE.search(lj) or DATE_RANGE_RE.search(lj):
+            if out:
+                break
+            continue
+        if _looks_like_company_line(lj) and out:
+            break
+        if "." in lj and len(lj) > 50:
+            continue
+        out.append(lj)
+    return out
+
+
+def _should_reject_skill_phrase(s: str) -> bool:
+    """
+    Drop false positives (candidate name, job title) using regex + spaCy NER.
+    Keeps real skill phrases across varied resume formats.
+    """
+    s = (s or "").strip()
+    if not s:
+        return True
+    if _JOB_TITLE_AS_SKILL_RE.match(s):
+        return True
+    if DEGREE_RE.search(f" {s}"):
+        return True
+    if _LANG_LINE_RE.match(s):
+        return True
+    if not SPACY_OK or _nlp is None:
+        return False
+    doc = _nlp(s[: min(len(s), 200)])
+    if not doc.ents:
+        return False
+    persons = [e for e in doc.ents if e.label_ == "PERSON"]
+    if not persons:
+        return False
+    text_span = doc.text.strip()
+    low_span = text_span.lower()
+    if re.search(r"\b(thinking|debugging|programming|solving|communication|resolution|development|architecture|performance)\b", low_span):
+        return False
+    # Single PERSON entity matching the whole phrase (e.g. full name)
+    if len(persons) == 1 and persons[0].text.strip() == text_span:
+        return True
+    alnum = lambda x: "".join(c for c in x.lower() if c.isalnum())
+    full_al = alnum(text_span)
+    if not full_al:
+        return False
+    covered_al = alnum(" ".join(e.text for e in persons))
+    if len(covered_al) / len(full_al) >= 0.85 and len(persons) <= 3:
+        return True
+    return False
+
+
 def _extract_skills(text: str, sections: dict[str, str]) -> list[str]:
     """
     Extract skills from the resume's SKILLS section (no predefined dictionary).
-    Handles templates where skills appear BEFORE the 'SKILLS' header.
+    Prefers bullet/line lists *below* SKILLS / SKILLS: (common Word templates).
+    Falls back to lines *above* SKILLS only when nothing follows the header (some Canva layouts).
     """
     text = _normalize_headers(text or "")
     lines = [l.strip() for l in text.split("\n")]
@@ -430,33 +592,40 @@ def _extract_skills(text: str, sections: dict[str, str]) -> list[str]:
             section_skills_text = ""
 
     block_lines: list[str] = []
-    idxs = [i for i, l in enumerate(lines) if l.strip().upper() in {"SKILLS", "AREAS OF EXPERTISE"} or l.strip().upper().startswith("AREAS OF EXPERTISE")]
+    had_skills_header = False
+    idxs = [i for i, l in enumerate(lines) if _skills_header_line_kind(l)]
     if idxs:
+        had_skills_header = True
         i0 = idxs[0]
-        header_token = (lines[i0] or "").strip().upper()
+        kind = _skills_header_line_kind(lines[i0])
+        forward = _collect_lines_after_skills_header(lines, i0)
 
-        # For SKILLS header we can scan upward (common Canva templates).
-        # For AREAS OF EXPERTISE, the header is often present but content may appear earlier,
-        # so we avoid scanning upward (it would capture education/companies).
-        if header_token == "SKILLS":
-            for j in range(i0 - 1, max(-1, i0 - 40), -1):
-                lj = (lines[j] or "").strip()
-                if not lj:
-                    break
-                if _is_probable_header_line(lj):
-                    break
-                low = lj.lower()
-                if any(x in low for x in ("@", "http", "www.", " st", " street", " city", "site.com")):
-                    break
-                if re.search(r"\d{3}[-\s]?\d{3}", lj):
-                    break
-                if "developer" in low:
-                    continue
-                if len(lj) <= 45:
-                    block_lines.append(lj)
-            block_lines.reverse()
-
-        # Intentionally do not collect after-SKILLS lines (often contact info)
+        if kind == "skills":
+            if forward:
+                block_lines = forward
+            else:
+                # Canva-style: short skill chips above the word SKILLS
+                for j in range(i0 - 1, max(-1, i0 - 40), -1):
+                    lj = (lines[j] or "").strip()
+                    if not lj:
+                        break
+                    if _is_probable_header_line(lj):
+                        break
+                    low = lj.lower()
+                    if any(x in low for x in ("@", "http", "www.", " street", " city", "site.com")):
+                        break
+                    if re.search(r"\b(?:st\.|st)\b", low) and re.search(r"\d", lj):
+                        break
+                    if re.search(r"\d{3}[-\s]?\d{3}", lj):
+                        break
+                    if "developer" in low:
+                        continue
+                    if len(lj) <= 45:
+                        block_lines.append(lj)
+                block_lines.reverse()
+        elif kind == "areas":
+            if forward:
+                block_lines = forward
     else:
         # Fallback: extract "expertise" list that often appears right after summary.
         all_lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
@@ -501,10 +670,24 @@ def _extract_skills(text: str, sections: dict[str, str]) -> list[str]:
             if 3 <= len(l) <= 55:
                 block_lines.append(l)
 
-    # If header-based extraction collected mostly non-skill lines, discard it.
-    block_lines = [l for l in block_lines if _clean_skill_token(l) and not _looks_like_company_line(l)]
+    # Drop company lines, junk tokens, names, and standalone job titles.
+    block_lines = [
+        l
+        for l in block_lines
+        if (ct := _clean_skill_token(l))
+        and not _looks_like_company_line(l)
+        and not _should_reject_skill_phrase(ct)
+    ]
 
-    candidate_text = "\n".join([t for t in [section_skills_text, "\n".join(block_lines)] if t])
+    # Prefer lines captured from the SKILLS header path so we never merge upward-scan
+    # garbage with a valid section body. Use section text only when the header path is empty.
+    if block_lines:
+        candidate_text = "\n".join(block_lines)
+    elif section_skills_text and not had_skills_header:
+        candidate_text = section_skills_text
+    else:
+        candidate_text = ""
+
     if not candidate_text:
         # Final fallback: scan top of resume for a compact "expertise list" block.
         all_lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
@@ -547,6 +730,16 @@ def _extract_skills(text: str, sections: dict[str, str]) -> list[str]:
     for tok in raw_tokens:
         cleaned = _clean_skill_token(tok)
         if not cleaned:
+            continue
+        # Split mixed tokens like "Problem Solving BS Software Engineering".
+        mixed_deg = re.search(r"\b(?:BS|MS|BE|ME|B\.?\s*TECH|M\.?\s*TECH|BACHELOR|MASTER|PHD|DIPLOMA)\b", cleaned, re.IGNORECASE)
+        if mixed_deg and mixed_deg.start() > 3:
+            left = _clean_skill_token(cleaned[:mixed_deg.start()].strip(" ,;:-"))
+            if left and not _should_reject_skill_phrase(left):
+                key_left = left.lower()
+                if key_left not in found:
+                    found[key_left] = left
+        if _should_reject_skill_phrase(cleaned):
             continue
         key = cleaned.lower()
         if key not in found:
@@ -608,7 +801,7 @@ def _looks_like_company_line(s: str) -> bool:
     if s.endswith(".") and re.match(r"^[a-z]", s):
         return False
 
-    if any(k in low for k in ("company", "inc", "ltd", "llc", "corp")):
+    if re.search(r"\b(company|inc\.?|ltd\.?|llc|corp\.?)\b", low):
         return True
 
     # Company-like suffixes / separators (word-boundary aware)
@@ -616,6 +809,10 @@ def _looks_like_company_line(s: str) -> bool:
         return True
 
     if re.search(r"\b(partners|agency|studio|labs|group|industries|technologies)\b", low):
+        if re.search(r"\b(skilled|experienced|utilizing|using|implement|develop|building|proficiency)\b", low):
+            return False
+        if "," in s or s.endswith("."):
+            return False
         return True
 
     # standalone "co" / "co." token
@@ -623,6 +820,24 @@ def _looks_like_company_line(s: str) -> bool:
         return True
 
     return False
+
+
+def _clean_company_name(s: str | None) -> str | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    m = re.search(
+        r"([A-Z][A-Za-z&.\- ]{1,90}\b(?:Company|Partners|Inc\.?|Ltd\.?|LLC|Corp\.?|Group|Studio|Labs|Technologies)\b)\s*$",
+        s,
+    )
+    if m:
+        return m.group(1).strip()
+    # Trim long sentence glue around company-like suffixes
+    if "." in s and len(s) > 35:
+        tail = s.split(".")[-1].strip()
+        if _looks_like_company_line(tail):
+            return tail
+    return s
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -640,7 +855,7 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
     text = _normalize_headers(text or "")
     # Prefer experience section; only fall back to full text if section is missing.
     exp_section = (sections.get("experience", "") or "").strip()
-    search_texts: list[str] = [exp_section] if exp_section else [text]
+    search_texts: list[str] = [exp_section, text] if exp_section else [text]
 
     seen_starts: set[str] = set()
     experiences: list[dict] = []
@@ -922,6 +1137,18 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
                 if _looks_like_company(pj):
                     prev_company = pj
                     break
+            next_company = None
+            for j in range(idx + 1, min(len(lines), idx + 18)):
+                nj = (lines[j] or "").strip()
+                if not nj:
+                    continue
+                if TITLE_DATE_RE.match(nj):
+                    break
+                if _is_probable_header_line(nj):
+                    break
+                if _looks_like_company(nj):
+                    next_company = nj
+                    break
 
             # If raw_title itself looks like a company name, treat it as company not job title.
             job_title = raw_title
@@ -958,9 +1185,13 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
                         job_title = paired_titles[paired_company_line_count]
                     paired_company_line_count += 1
 
+            # Common PDF order issue: company appears after title/date in flattened text.
+            if not company_name and next_company:
+                company_name = next_company
+
             # Skip education rows that look like "2024 - 2028 | University"
             window = " ".join([(lines[j] or "") for j in range(max(0, idx - 2), min(len(lines), idx + 3))]).lower()
-            if "university" in window or DEGREE_RE.search(window):
+            if "university" in window:
                 continue
 
             duration = _duration_months(start_date, end_date)
@@ -972,6 +1203,33 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
                 "durationInMonths": duration,
                 "description"     : None,
             })
+
+        # If two consecutive rows ended up with same company and second row has a nearer
+        # forward company token, remap the second one (common in mixed two-column PDFs).
+        for i in range(1, len(experiences)):
+            cur = experiences[i]
+            prev = experiences[i - 1]
+            if not cur.get("startDate"):
+                continue
+            if (cur.get("companyName") or "").strip() and (cur.get("companyName") == prev.get("companyName")):
+                row_idx = None
+                for j, line in enumerate(lines):
+                    if TITLE_DATE_RE.match((line or "").strip()):
+                        mrow = TITLE_DATE_RE.match((line or "").strip())
+                        if mrow and (mrow.group("start") or "").strip().lower() == (cur.get("startDate") or "").strip().lower():
+                            row_idx = j
+                            break
+                if row_idx is None:
+                    continue
+                for j in range(row_idx + 1, min(len(lines), row_idx + 20)):
+                    nj = (lines[j] or "").strip()
+                    if not nj:
+                        continue
+                    if TITLE_DATE_RE.match(nj):
+                        break
+                    if _looks_like_company(nj) and nj != cur.get("companyName"):
+                        cur["companyName"] = nj
+                        break
 
         if has_pipe_format:
             continue
@@ -1052,6 +1310,27 @@ def _extract_experience(text: str, sections: dict[str, str]) -> list[dict]:
             })
 
     # If absolutely nothing found, try spaCy fallback
+    if experiences:
+        # Post-fix for mixed two-column PDFs: map company tokens by chronology.
+        company_tokens: list[str] = []
+        for l in [x.strip() for x in text.split("\n") if x.strip()]:
+            if _is_probable_header_line(l) or DATE_RANGE_RE.search(l) or TITLE_DATE_RE.match(l):
+                continue
+            if _looks_like_company(l) and l not in company_tokens:
+                company_tokens.append(l)
+        if len(company_tokens) >= 2 and len(experiences) >= 2:
+            def _year_start(exp: dict) -> int:
+                m = re.search(r"\b(19\d{2}|20\d{2})\b", (exp.get("startDate") or ""))
+                return int(m.group(1)) if m else 0
+            ordered_idx = sorted(range(len(experiences)), key=lambda i: _year_start(experiences[i]), reverse=True)
+            for pos, i in enumerate(ordered_idx[:len(company_tokens)]):
+                target_company = company_tokens[pos]
+                cur_company = (experiences[i].get("companyName") or "").strip()
+                if not cur_company or (pos > 0 and cur_company in company_tokens[:pos]):
+                    experiences[i]["companyName"] = target_company
+        for e in experiences:
+            e["companyName"] = _clean_company_name(e.get("companyName"))
+
     if not experiences and SPACY_OK and _nlp is not None:
         return _extract_experience_spacy(text)
 
@@ -1200,13 +1479,18 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
                     i += 1
                     continue
 
-            # handle "YYYY - YYYY | University" line
+            # handle "YYYY - YYYY | University" or "University | YYYY - YYYY" line
             if "|" in line and DATE_RANGE_RE.search(line):
                 yr = DATE_RANGE_RE.search(line)
                 start_raw = (yr.group("start") or "").strip() if yr else ""
                 end_raw = (yr.group("end") or "").strip() if yr else ""
                 parts = [p.strip() for p in line.split("|") if p.strip()]
-                uni = parts[-1] if parts else None
+                uni = None
+                if parts:
+                    for seg in (parts[0], parts[-1]):
+                        if seg and _pipe_segment_is_institution_name(seg):
+                            uni = seg
+                            break
                 years = re.findall(r"\b(19\d{2}|20\d{2})\b", f"{start_raw} {end_raw}")
                 start_year = int(years[0]) if years else None
                 end_year = int(years[1]) if len(years) > 1 else (int(years[0]) if years else None)
@@ -1215,9 +1499,24 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
                 degree = None
                 if deg_line and not DATE_RANGE_RE.search(deg_line) and not _is_probable_header_line(deg_line):
                     degree = deg_line.strip()
-                if degree and (DEGREE_RE.search(degree) or degree.isupper() or "bachelor" in degree.lower() or "master" in degree.lower()):
+                if degree and (
+                    DEGREE_RE.search(degree)
+                    or re.match(r"^(?:ME|BE|BS|MS|BTECH|MTECH)\b", degree.strip())
+                    or degree.isupper()
+                    or "bachelor" in degree.lower()
+                    or "master" in degree.lower()
+                ):
                     out.append({
                         "degree": degree,
+                        "fieldOfStudy": None,
+                        "university": uni,
+                        "startYear": start_year,
+                        "endYear": end_year,
+                    })
+                elif uni and (start_year or end_year) and _is_plausible_education_university(uni):
+                    # Some templates separate degree text away from university/year line.
+                    out.append({
+                        "degree": None,
                         "fieldOfStudy": None,
                         "university": uni,
                         "startYear": start_year,
@@ -1266,7 +1565,7 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
                 prev = raw_lines[i - 1]
                 if not _is_probable_header_line(prev):
                     low = prev.lower()
-                    if "company" not in low and re.search(r"(university|college|school|institute|academy|polytechnic|high)", low):
+                    if "company" not in low and _is_plausible_education_university(prev):
                         institution = prev
 
             # degree tends to be after year line
@@ -1315,17 +1614,25 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
 
             # Final validation: only accept blocks that look education-like
             window = " ".join(raw_lines[max(0, i - 2): min(len(raw_lines), i + 6)]).lower()
-            looks_edu = bool(re.search(r"\b(university|college|school|institute|academy|polytechnic)\b", window))
+            looks_edu = bool(
+                re.search(
+                    r"\b(university|college|institute|academy|polytechnic)\b|\bhigh\s+school\b|\bschool\b",
+                    window,
+                )
+            )
             looks_degree = bool(re.search(r"\b(bachelor|master|secondary|hsc|ssc|phd|diploma|associate)\b", window))
 
-            if (institution or degree) and (looks_edu or looks_degree):
-                out.append({
-                    "degree": degree,
-                    "fieldOfStudy": field_of_study,
-                    "university": institution,
-                    "startYear": start_year,
-                    "endYear": end_year,
-                })
+            if (looks_edu or looks_degree):
+                if institution and not _is_plausible_education_university(institution):
+                    institution = None
+                if institution or degree:
+                    out.append({
+                        "degree": degree,
+                        "fieldOfStudy": field_of_study,
+                        "university": institution,
+                        "startYear": start_year,
+                        "endYear": end_year,
+                    })
 
             i = max(i + 1, j)
         return out
@@ -1406,6 +1713,12 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
                 orgs = [e.text for e in doc.ents if e.label_ == "ORG"]
                 university = orgs[0] if orgs else None
 
+            # Guardrail: avoid experience rows being misread as education paragraphs.
+            if not university and not re.search(r"\b(university|college|institute|school|academy|polytechnic)\b", para, re.IGNORECASE):
+                continue
+            if university and not _is_plausible_education_university(university):
+                continue
+
             # Years: "YYYY - YYYY" or "YYYY | YYYY" or "YYYY"
             years = re.findall(r"\b(19\d{2}|20\d{2})\b", para)
             start_year = int(years[0]) if years else None
@@ -1420,11 +1733,39 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
             })
 
     # Final cleanup: remove obvious noise rows
+    # Fill missing degree labels from orphan degree lines when university+years are present.
+    orphan_degree_candidates: list[str] = []
+    for l in [x.strip() for x in (text or "").split("\n") if x.strip()]:
+        if DATE_RANGE_RE.search(l) or _is_probable_header_line(l) or _looks_like_company_line(l):
+            continue
+        mdeg = re.search(
+            r"\b(?:BS|MS|BE|ME|B\.?\s*TECH|M\.?\s*TECH|BACHELOR|MASTER|PHD|DIPLOMA)\b[^\n|]{0,80}",
+            l,
+            re.IGNORECASE,
+        )
+        if not mdeg and not DEGREE_RE.search(f" {l}"):
+            continue
+        cand = (mdeg.group(0).strip() if mdeg else l.strip())
+        if len(cand) < 4:
+            continue
+        orphan_degree_candidates.append(cand)
+    used_degrees = {(e.get("degree") or "").strip().lower() for e in education if (e.get("degree") or "").strip()}
+    orphan_degree_candidates = [d for d in orphan_degree_candidates if d.strip().lower() not in used_degrees]
+    for e in sorted(education, key=lambda x: ((x.get("startYear") or 9999), (x.get("endYear") or 9999))):
+        if e.get("degree"):
+            continue
+        if not e.get("university") or (not e.get("startYear") and not e.get("endYear")):
+            continue
+        if orphan_degree_candidates and _is_plausible_education_university(e.get("university")):
+            e["degree"] = orphan_degree_candidates.pop(0)
+
     cleaned: list[dict] = []
     has_year_based = any(e.get("startYear") or e.get("endYear") for e in education)
     for e in education:
         uni = (e.get("university") or "").strip()
         deg = (e.get("degree") or "").strip()
+        if uni and not _is_plausible_education_university(uni):
+            continue
         if uni.upper() in {"SCHOOL"}:
             continue
         if uni and deg and uni.strip().lower() == deg.strip().lower():
@@ -1432,12 +1773,31 @@ def _extract_education(text: str, sections: dict[str, str]) -> list[dict]:
         # If we already have a proper year-based education, drop fuzzy no-year rows
         if has_year_based and not e.get("startYear") and not e.get("endYear"):
             continue
-        # Keep only rows that have at least degree+years or degree+university
-        if not deg:
+        # Keep rows with either a degree, or a university+year range.
+        if not deg and not (uni and (e.get("startYear") or e.get("endYear"))):
             continue
-        if not uni and not e.get("startYear") and not e.get("endYear"):
+        if not uni and not deg and not e.get("startYear") and not e.get("endYear"):
             continue
         cleaned.append(e)
+
+    # Prefer one row per (university, years): keep the entry with the richest degree text.
+    deduped: dict[tuple, dict] = {}
+    for e in cleaned:
+        key = (
+            (e.get("university") or "").strip().lower(),
+            e.get("startYear"),
+            e.get("endYear"),
+        )
+        prev = deduped.get(key)
+        if prev is None:
+            deduped[key] = e
+            continue
+        pdeg = len((prev.get("degree") or "").strip())
+        cdeg = len((e.get("degree") or "").strip())
+        if cdeg > pdeg or (cdeg == pdeg and (e.get("fieldOfStudy") or "") > (prev.get("fieldOfStudy") or "")):
+            deduped[key] = e
+    cleaned = list(deduped.values())
+    cleaned.sort(key=lambda x: ((x.get("startYear") or 0), (x.get("endYear") or 0)))
 
     return cleaned[:5]  # cap at 5 entries
 

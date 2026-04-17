@@ -1934,6 +1934,467 @@ def score_match():
     return jsonify(result)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ATS Application Match Scoring  (Skills 50% | Experience 30% | Education 20%)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Education equivalence groups – any two members in the same list are treated as equivalent.
+# Prefix tokens (e.g. "bs") that might appear at the *start* of a longer degree string
+# (e.g. "BS Software Engineering") are intentionally short so that `_group_of` below
+# uses startswith-based matching instead of substring to avoid false positives.
+_EDU_EQUIV_GROUPS: list[list[str]] = [
+    # Bachelor of Technology / Engineering
+    ["b.tech", "be", "b.e", "bachelor of engineering", "bachelor of technology",
+     "b-tech", "btech", "bachelor of technology" , "b.tech"],
+    # Bachelor of Science (includes BS/B.Sc prefixes common in US/UK/Indian degrees)
+    ["b.sc", "bsc", "bs", "b.s", "bachelor of science", "bachelor of computer science",
+     "bachelor of computer applications", "bca", "b.c.a"],
+    # Bachelor of Commerce
+    ["b.com", "bcom", "bachelor of commerce"],
+    # Bachelor of Arts
+    ["b.a", "ba", "bachelor of arts"],
+    # Bachelor of Business Administration
+    ["bba", "bachelor of business administration"],
+    # MCA
+    ["mca", "m.c.a", "master of computer applications"],
+    # Master of Engineering / Technology
+    ["m.tech", "me", "m.e", "mtech", "m-tech",
+     "master of engineering", "master of technology",
+     "master of science in engineering"],
+    # Master of Science
+    ["m.sc", "msc", "ms", "m.s", "master of science"],
+    # MBA
+    ["mba", "m.b.a", "master of business administration"],
+    # PhD
+    ["phd", "ph.d", "doctorate", "doctor of philosophy"],
+    # Diploma
+    ["diploma"],
+    # 12th / HSC
+    ["high school", "hsc", "12th", "secondary", "higher secondary"],
+    # 10th / SSC
+    ["ssc", "10th", "matriculation"],
+]
+
+
+def _edu_degree_prefix(norm: str) -> str:
+    """Return only the degree prefix token(s) before any field-of-study words.
+
+    E.g. 'bs software engineering' → 'bs'
+         'bachelor of technology'   → 'bachelor of technology'
+         'me software development'  → 'me'
+    """
+    # Strip common field-of-study connectors and everything after them
+    cut = re.split(
+        r"\b(?:in|of|and|with|from|for)\b",
+        norm,
+        maxsplit=1,
+    )
+    prefix = cut[0].strip() if cut else norm
+    # If the prefix is just a short abbreviation token, return it;
+    # otherwise return the full cleaned string.
+    return prefix
+
+_SENIOR_TITLES = re.compile(
+    r"\b(senior|sr\.?|lead|principal|staff|head|director|vp|cto|cfo|ceo)\b",
+    re.IGNORECASE,
+)
+
+_EXPERIENCE_LEVEL_YEARS: dict[str, int] = {
+    "entry":     0,
+    "entry level": 0,
+    "junior":    0,
+    "mid":       2,
+    "mid level": 2,
+    "senior":    4,
+    "senior level": 4,
+    "lead":      6,
+    "principal": 8,
+    "staff":     8,
+    "executive": 10,
+}
+
+
+def _normalise_edu_label(label: str) -> str:
+    s = re.sub(r"[^a-z0-9 .]", "", label.strip().lower())
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _edu_labels_match(candidate_deg: str, required: str) -> bool:
+    """
+    True if candidate_deg satisfies the required education (or is equivalent).
+    Handles slash-separated requirements like 'B-Tech / MCA'.
+
+    Matching logic (in order):
+      1. Exact substring of the full normalised strings.
+      2. Prefix-based group lookup – strips field-of-study noise
+         ("BS Software Engineering" → prefix "bs" → group bsc/bs).
+      3. Full-string group lookup as a final fallback.
+    """
+    cand_norm   = _normalise_edu_label(candidate_deg)
+    cand_prefix = _edu_degree_prefix(cand_norm)
+    req_parts   = [_normalise_edu_label(p.strip()) for p in re.split(r"[/,|]", required) if p.strip()]
+
+    def _group_of(label: str) -> int | None:
+        for i, group in enumerate(_EDU_EQUIV_GROUPS):
+            for g in group:
+                # Exact match or one is a prefix/suffix of the other
+                if g == label or label.startswith(g + " ") or label == g or g.startswith(label + " "):
+                    return i
+                # Full containment (handles longer degree strings)
+                if g in label or label in g:
+                    return i
+        return None
+
+    cand_group        = _group_of(cand_prefix) or _group_of(cand_norm)
+    for req_norm in req_parts:
+        req_prefix = _edu_degree_prefix(req_norm)
+        req_group  = _group_of(req_prefix) or _group_of(req_norm)
+
+        # Direct substring match on full strings
+        if req_norm and (req_norm in cand_norm or cand_norm in req_norm):
+            return True
+        # Group equivalence via prefix
+        if cand_group is not None and req_group is not None and cand_group == req_group:
+            return True
+    return False
+
+
+def _score_education(
+    candidate_education: list[dict],
+    education_requirement: str | None,
+) -> float:
+    """
+    Return 0-100 education match score.
+
+    Matching is based ONLY on the Degree field (not FieldOfStudy / University).
+    This avoids false mismatches when fields like "Computer Science" are absent
+    from the candidate record but the degree abbreviation clearly matches.
+    """
+    if not education_requirement or not education_requirement.strip():
+        return 100.0
+
+    if not candidate_education:
+        return 0.0
+
+    req = education_requirement.strip()
+
+    # ── Pass 1: exact equivalence-group match on Degree only ─────────────
+    for edu in candidate_education:
+        deg = (edu.get("degree") or "").strip()
+        if not deg:
+            continue
+        if _edu_labels_match(deg, req):
+            return 100.0
+
+    # ── Pass 2: NLP similarity on Degree only (spaCy vector fallback) ────
+    if SPACY_OK and _nlp is not None:
+        req_doc = _nlp(req[:300])
+        best = 0.0
+        for edu in candidate_education:
+            deg = (edu.get("degree") or "").strip()
+            if not deg:
+                continue
+            deg_doc = _nlp(deg[:300])
+            if req_doc.vector_norm and deg_doc.vector_norm:
+                sim = req_doc.similarity(deg_doc) * 100
+                best = max(best, sim)
+        return round(min(100.0, best), 2)
+
+    return 0.0
+
+
+def _extract_required_years(experience_required: str | None) -> float | None:
+    """Parse 'ExperienceRequired' strings like '4', '3-5', '4 years', '3+ years' → float."""
+    if not experience_required:
+        return None
+    s = str(experience_required).strip()
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)", s)
+    if m:
+        return (float(m.group(1)) + float(m.group(2))) / 2
+    m2 = re.search(r"(\d+(?:\.\d+)?)", s)
+    if m2:
+        return float(m2.group(1))
+    return None
+
+
+_CURRENT_YEAR = datetime.now().year
+
+
+def _score_experience(
+    candidate_experiences: list[dict],
+    experience_required: str | None,
+    experience_level: str | None,
+) -> tuple[float, float]:
+    """
+    Return (score_0_100, candidate_total_years).
+
+    If durationInMonths is pre-computed and stored by the C# service, it is trusted
+    directly (no start-year re-validation).  This handles fictional/template resumes
+    with future dates (e.g. "2035 – Present") correctly.
+
+    When durationInMonths is missing, dates are parsed and junk years (e.g. "0010")
+    are ignored, but the strict "must be past year" guard is removed so that the
+    absolute date difference is always counted.
+    """
+    total_months = 0
+    for exp in candidate_experiences:
+        dur = exp.get("durationInMonths")
+        if isinstance(dur, (int, float)) and dur > 0:
+            # Pre-computed by C# service – trust it unconditionally.
+            total_months += int(dur)
+        else:
+            # Estimate from raw dates (fallback when duration not stored).
+            s_raw = str(exp.get("startDate") or "")
+            e_raw = str(exp.get("endDate") or "")
+            sy_m = re.search(r"\b(19|20)(\d{2})\b", s_raw)
+            if not sy_m:
+                continue   # no parseable start year at all
+            s_y = int(sy_m.group())
+            is_present = bool(re.match(r"present|current|now", e_raw.strip(), re.IGNORECASE))
+            if is_present:
+                e_y = _CURRENT_YEAR
+            else:
+                ey_m = re.search(r"\b(19|20)(\d{2})\b", e_raw)
+                if not ey_m:
+                    continue
+                e_y = int(ey_m.group())
+            # Use abs so future-dated entries contribute rather than score zero.
+            total_months += abs((e_y - s_y) * 12)
+
+    candidate_years = total_months / 12.0
+
+    # Determine required years from ExperienceRequired field or ExperienceLevel label
+    req_years = _extract_required_years(experience_required)
+    if req_years is None and experience_level:
+        lvl = experience_level.strip().lower()
+        req_years = _EXPERIENCE_LEVEL_YEARS.get(lvl)
+
+    # KEY FIX: if NEITHER field is set on the job, return (0, years) so the
+    # caller can mark it as "not configured" rather than silently giving 100.
+    if req_years is None:
+        return (0.0, candidate_years)
+
+    if req_years == 0:
+        return (100.0, candidate_years)
+
+    if candidate_years >= req_years:
+        return (100.0, candidate_years)
+
+    score = (candidate_years / req_years) * 100
+    return (round(min(100.0, score), 2), candidate_years)
+
+
+def _skills_from_job_title(job_title: str) -> list[str]:
+    """
+    Extract likely technology keywords from a job title, e.g.
+    "Senior .NET Developer" → [".NET"]
+    "React + Node.js Engineer" → ["React", "Node.js"]
+    """
+    if not job_title:
+        return []
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9#\+\-\.]{1,30}", job_title)
+    stop = {
+        "senior", "junior", "mid", "lead", "principal", "staff", "developer",
+        "engineer", "architect", "analyst", "consultant", "manager", "specialist",
+        "intern", "associate", "full", "stack", "fullstack", "backend", "frontend",
+        "remote", "contract", "part", "time", "and", "or", "with", "the",
+    }
+    return [t for t in tokens if t.lower() not in stop]
+
+
+def _score_skills_with_nlp(
+    candidate_skills: list[str],
+    job_skills: list[str],
+    job_title: str | None,
+    job_description: str | None,
+) -> dict:
+    """
+    Skills scoring:
+    1. When job_skills is non-empty (fetched from CompanyDepartmentSkills), use it as
+       the ONLY authoritative set.  Do NOT augment from the job description – that would
+       add noise tokens (e.g. capitalised words from a generic description) and falsely
+       inflate the denominator, making a 3/3 match look like 3/11 = 21%.
+    2. Only when job_skills is COMPLETELY EMPTY do we fall back to extracting keywords
+       from the job title and description (best-effort).
+    3. If after all extraction no skills are found → skillsNotConfigured = True.
+    """
+    if job_skills:
+        # ── DB skills are authoritative ───────────────────────────────────────
+        all_job_skills = list({s.strip() for s in job_skills if s.strip()})
+        logger.info(
+            "match-application  skill: using %d DB skills for title=%r",
+            len(all_job_skills), job_title,
+        )
+    else:
+        # ── No DB skills – fall back to title + description extraction ────────
+        extra: list[str] = []
+        extra.extend(_skills_from_job_title(job_title or ""))
+
+        if job_description and len(job_description.strip()) > 20:
+            if SPACY_OK and _nlp is not None:
+                doc = _nlp(job_description[:3000])
+                for chunk in doc.noun_chunks:
+                    t = chunk.text.strip()
+                    if 2 <= len(t) <= 40 and not re.search(
+                        r"\b(year|month|day|team|company|role|experience|candidate|position|salary)\b",
+                        t, re.IGNORECASE
+                    ):
+                        extra.append(t)
+            techs = re.findall(r"\b[A-Z][A-Za-z0-9#\+\-\.]{1,30}\b", job_description)
+            extra.extend(techs)
+
+        all_job_skills = list({s.strip() for s in extra if s.strip()})
+        logger.info(
+            "match-application  skill: no DB skills – inferred %d from title/description for title=%r",
+            len(all_job_skills), job_title,
+        )
+
+    if not all_job_skills:
+        logger.info(
+            "match-application  skill: no job skills found for title=%r – returning 0",
+            job_title,
+        )
+        return {
+            "score": 0.0, "skillScore": 0.0,
+            "exactScore": 0.0, "semanticScore": 0.0,
+            "matchedSkills": [],
+            "missingSkills": [],
+            "skillsNotConfigured": True,
+        }
+
+    base = _score_skill_match(candidate_skills, all_job_skills)
+
+    return {
+        "score"              : base["score"],
+        "skillScore"         : base["score"],
+        "exactScore"         : base.get("exact_score", 0),
+        "semanticScore"      : base.get("semantic_score", 0),
+        "matchedSkills"      : base.get("matched_skills", []),
+        "missingSkills"      : base.get("missing_skills", []),
+        "skillsNotConfigured": False,
+    }
+
+
+@app.route("/match-application", methods=["POST"])
+def match_application():
+    """
+    Full ATS scoring endpoint.
+
+    Body (JSON):
+    {
+      "candidateSkills"     : ["C#", ".NET", "SQL"],
+      "candidateExperiences": [
+          {"startDate": "2020", "endDate": "Present", "durationInMonths": 60, ...}
+      ],
+      "candidateEducation"  : [
+          {"degree": "B.Tech", "fieldOfStudy": "Computer Science", "endYear": 2020}
+      ],
+      "jobRequirements": {
+          "jobTitle"              : "Senior .NET Developer",
+          "description"           : "...",
+          "skills"                : [".NET", "SQL", "Azure"],
+          "experienceRequired"    : "4",
+          "experienceLevel"       : "Senior",
+          "educationRequirement"  : "B-Tech / MCA"
+      }
+    }
+
+    Weights: Skills 50%  |  Experience 30%  |  Education 20%
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be JSON."}), 400
+
+    candidate_skills      = data.get("candidateSkills") or []
+    candidate_experiences = data.get("candidateExperiences") or []
+    candidate_education   = data.get("candidateEducation") or []
+    job_req               = data.get("jobRequirements") or {}
+
+    job_skills        = job_req.get("skills") or []
+    job_title         = job_req.get("jobTitle") or ""
+    job_description   = job_req.get("description") or ""
+    exp_required      = job_req.get("experienceRequired")
+    exp_level         = job_req.get("experienceLevel")
+    edu_required      = job_req.get("educationRequirement")
+
+    # ── Factor scores (each 0-100) ────────────────────────────────────
+    skill_result  = _score_skills_with_nlp(candidate_skills, job_skills, job_title, job_description)
+    skill_score   = round(skill_result["skillScore"], 2)
+
+    exp_not_configured = (
+        (exp_required is None or str(exp_required).strip() == "") and
+        (exp_level is None or str(exp_level).strip() == "")
+    )
+    edu_not_configured = not edu_required or not edu_required.strip()
+
+    exp_score_raw, candidate_years = _score_experience(candidate_experiences, exp_required, exp_level)
+
+    # ── Effective scores ───────────────────────────────────────────────
+    # When a job requirement is not configured, the factor is treated as
+    # "no constraint" (full marks).  We return the EFFECTIVE value so that
+    # what is stored in the DB matches what is used in the total calculation.
+    eff_skill_score = skill_score
+    eff_exp_score   = 100.0 if exp_not_configured else round(exp_score_raw, 2)
+    eff_edu_score   = round(_score_education(candidate_education, edu_required), 2)
+
+    # ── Weighted total (50 / 30 / 20) ─────────────────────────────────
+    total_score = round(eff_skill_score * 0.50 + eff_exp_score * 0.30 + eff_edu_score * 0.20, 2)
+
+    # ── Human-readable recommendation ─────────────────────────────────
+    if total_score >= 80:
+        recommendation = "Excellent Match"
+    elif total_score >= 65:
+        recommendation = "Strong Match"
+    elif total_score >= 45:
+        recommendation = "Moderate Match"
+    elif total_score >= 25:
+        recommendation = "Weak Match"
+    else:
+        recommendation = "Poor Match"
+
+    warnings: list[str] = []
+    if skill_result.get("skillsNotConfigured"):
+        warnings.append("Job skills not configured – skill score could not be calculated.")
+    if exp_not_configured:
+        warnings.append(
+            f"ExperienceRequired/Level not set on job – experience not factored "
+            f"(candidate has {round(candidate_years, 1)} yrs total)."
+        )
+    if edu_not_configured:
+        warnings.append("EducationRequirement not set on job – education not factored.")
+
+    logger.info(
+        "match-application  total=%.1f  skill=%.1f  exp=%.1f  edu=%.1f"
+        "  candYrs=%.1f  expCfg=%s  eduCfg=%s  [%s]%s",
+        total_score, eff_skill_score, eff_exp_score, eff_edu_score,
+        candidate_years,
+        not exp_not_configured, not edu_not_configured,
+        recommendation,
+        ("  WARN:" + "; ".join(warnings)) if warnings else "",
+    )
+
+    return jsonify({
+        "totalScore"           : total_score,
+        # Return EFFECTIVE scores – these match what is stored in the DB
+        # and what is used in the weighted total.
+        "skillScore"           : eff_skill_score,
+        "experienceScore"      : eff_exp_score,
+        "educationScore"       : eff_edu_score,
+        "candidateYears"       : round(candidate_years, 1),
+        "skillWeight"          : 0.50,
+        "experienceWeight"     : 0.30,
+        "educationWeight"      : 0.20,
+        "matchedSkills"        : skill_result.get("matchedSkills", []),
+        "missingSkills"        : skill_result.get("missingSkills", []),
+        "recommendation"       : recommendation,
+        "skillsNotConfigured"  : skill_result.get("skillsNotConfigured", False),
+        "expNotConfigured"     : exp_not_configured,
+        "eduNotConfigured"     : edu_not_configured,
+        "warnings"             : warnings,
+    })
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -1949,6 +2410,6 @@ if __name__ == "__main__":
     port  = int(os.environ.get("PARSER_PORT", 5001))
     logger.info("=" * 65)
     logger.info("  ATS Resume Parser (NLP Edition) – http://localhost:%d", port)
-    logger.info("  POST /parse-resume    POST /score-match    GET /health")
+    logger.info("  POST /parse-resume    POST /score-match    POST /match-application    GET /health")
     logger.info("=" * 65)
     app.run(host="127.0.0.1", port=port, debug=False)

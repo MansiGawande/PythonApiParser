@@ -2087,7 +2087,21 @@ def _score_education(
         if _edu_labels_match(deg, req):
             return 100.0
 
-    # ── Pass 2: NLP similarity on Degree only (spaCy vector fallback) ────
+    # ── Pass 2: keyword-overlap check before NLP ─────────────────────────
+    # Strip stopwords and check if any requirement word appears in degree+fieldOfStudy
+    _stop = {'of', 'in', 'the', 'a', 'an', 'and', 'or', 'for', 'to', 'with', 'from'}
+    req_words = {w for w in re.sub(r'[^a-z0-9 ]', '', req.lower()).split() if w not in _stop and len(w) > 2}
+    has_keyword_overlap = False
+    for edu in candidate_education:
+        deg   = (edu.get("degree")      or "").strip().lower()
+        field = (edu.get("fieldOfStudy") or "").strip().lower()
+        combined_words = {w for w in re.sub(r'[^a-z0-9 ]', '', (deg + " " + field)).split()
+                          if w not in _stop and len(w) > 2}
+        if req_words & combined_words:
+            has_keyword_overlap = True
+            break
+
+    # ── Pass 3: NLP similarity on Degree only (spaCy vector fallback) ────
     if SPACY_OK and _nlp is not None:
         req_doc = _nlp(req[:300])
         best = 0.0
@@ -2099,8 +2113,16 @@ def _score_education(
             if req_doc.vector_norm and deg_doc.vector_norm:
                 sim = req_doc.similarity(deg_doc) * 100
                 best = max(best, sim)
+
+        # If no keyword overlap, spaCy domain-similarity is misleadingly high.
+        # "Civil" ~ "Computer Science" returns ~39% but is a clear mismatch.
+        # Rule: no keyword overlap + similarity < 70 → hard 0.
+        if not has_keyword_overlap and best < 70.0:
+            return 0.0
+
         return round(min(100.0, best), 2)
 
+    # No NLP available and no keyword overlap → 0
     return 0.0
 
 
